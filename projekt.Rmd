@@ -1,0 +1,165 @@
+---
+title: "Analiza danych pacjentów chorych na COVID-19"
+author: "Adam Kurzawa"
+date: "22 11 2020"
+output:
+  html_document: 
+    toc: yes
+    toc_float: yes
+---
+
+# Wstęp
+Projekt zakładał analizę danych pacjentów chorych na COVID-19. Przetworzenie danych ze zbioru umożliwiło sporządzenie raportu zawierającego wykresy takie jak rozkład wyzdrowień i śmierci. Podjęto także próbę stworzenia klasyfikatora, który będzie potrafił wskazać czy dany pacjent przeżyje.
+
+# Wczytanie bibliotek
+```{r wczytanie bibliotek, message=FALSE}
+library("readxl")
+library("dplyr")
+library(skimr)
+library(plotly)
+library(ggplot2)
+library(DT)
+library(hablar)
+library(reshape2)
+library(tidyr)
+library(caret)
+set.seed(23)
+```
+
+# Wczytanie danych.
+```{r wczytanie danych}
+data = data.frame(read_excel("wuhan_blood_sample_data_Jan_Feb_2020.xlsx"))
+```
+
+
+# Czyszczenie zbioru.
+Data próbki została przycięte do formatu "yyyy-MM-dd".Następnie dane zostały zgrupowane pod dacie przyjęcia oraz dacie opuszenia szpitala, z powodu wyzdrowienia lub zgonu. Co umożliwiło przypisanie brakujących PATIENT_ID.
+```{r}
+df <- mutate(data, RE_DATE = as.Date(substr(RE_DATE,1,10), "%Y-%m-%d"))
+df <- df %>% group_by(Admission.time, Discharge.time) %>% mutate(PATIENT_ID = max(PATIENT_ID, na.rm = TRUE)) %>% ungroup()
+df <- df %>% group_by(PATIENT_ID, RE_DATE) %>% 
+  mutate(Admission.time = max(Admission.time, na.rm = TRUE)) %>%
+  mutate(Discharge.time = max(Discharge.time, na.rm = TRUE))%>% ungroup()
+```
+Wszystkie próbki z danego dnia dla danego pacjenta zostały zgrupowane.
+```{r}
+df <- df %>% group_by(PATIENT_ID, RE_DATE, Admission.time, Discharge.time, age, outcome, gender) %>% summarise_all(sum_) %>% ungroup()
+```
+Dane liczbowe odpowiadające płci zostały zamienione na dane tekstowe.
+```{r}
+df <- df %>% mutate(gender = factor(gender, labels = c('male', 'female')))
+df <- df %>% mutate(outcome = factor(outcome, labels = c('survived', 'died')))
+```
+Kolumny i wiersze zawierające niekompletne dane zostały usunięte.
+```{r}
+df$X2019.nCoV.nucleic.acid.detection = NULL
+df <- subset(df, !is.na(RE_DATE))
+```
+Tabela przedstawia zbiór po przetworzeniu.
+```{r}
+datatable(df,options = list(scrollX = TRUE), filter = 'top')
+```
+
+# Podsumowanie zbioru.
+```{r, message=FALSE}
+my_skim <- skim_with(character = sfl(), append = FALSE, base = sfl(n_missing))
+datatable(my_skim(df), options = list(scrollX = TRUE))
+```
+
+# Wpływ wartości wybranych atrybutów na zgon pacjenta.
+Wykresy przedstawiają wpływ wartości dehydrogenazy mleczanowej (LDH), białka C-reaktywnego (hs-CRP), oraz liczby limfocytów.
+```{r, message=FALSE, warning=FALSE}
+last_data <- df
+last_data <- last_data %>% group_by(PATIENT_ID) %>%
+  summarise(outcome = last(outcome), LDH = last(Lactate.dehydrogenase), Limfocyty = last(Lactate.dehydrogenase), 'hs-CRP' = last(High.sensitivity.C.reactive.protein)) %>% ungroup()
+
+last_data[ ,c('PATIENT_ID')] <- list(NULL)
+datatable(last_data)
+last_plot_data = melt(last_data, id=c("outcome"))
+graph <- ggplot(last_plot_data, aes(x=value, y=outcome)) + geom_point() + facet_wrap(~variable)
+ggplotly(graph)
+```
+
+# Pacjenci opuszczający szpital w danym dniu.
+Wykres przedstawia dane dla każdego dnia. Zsumowana została liczba pacjentów opuszczających szpital z podziałem na zgony oraz wyzdrowienia. 
+```{r, message=FALSE, warning=FALSE}
+by_date <- mutate(df, Discharge.time = substr(Discharge.time,1,10))
+by_date <- by_date %>% group_by(Discharge.time, PATIENT_ID) %>% mutate(outcome = first(outcome == "died")) %>%
+  summarise(outcome = first(outcome)) %>% group_by(Discharge.time) %>%
+  summarise(Pacjenci = n_distinct(PATIENT_ID), Zgony = sum(outcome == TRUE), Wyzdrowienia = sum(outcome == FALSE))
+
+plot_data = melt(by_date, id=c("Discharge.time"))
+
+p <- ggplot(plot_data) + 
+  geom_point(aes(x = Discharge.time, y = value, color = variable,
+                 text = paste(' Dzień: ', Discharge.time,'<br>','Liczba: ',value,'<br>','Typ: ',variable))) + 
+  scale_colour_manual(values=c("black","red","green")) +
+  labs(color = "Legenda", x = "Dzień", y = "Liczba") +
+  theme(axis.text.x = element_text(angle = 90, vjust = 0.5, hjust=1))
+
+g <- ggplotly(p, tooltip = "text") %>% layout(legend = list(x = 0.05, y = 0.95))
+g
+```
+
+# Przygotowanie klasyfikatora przewidującego czy dany pacjent przeżyje.
+Przed przystąpienie do uczenia klasyfikatora dane zostały odpowiednio przygotowane. Ze zbioru zostali usunięci pacjenci ze zbyt mała liczbą przeprowadzonych badan oraz badańia wykonane na zbyt małej liczbie pacjentów.
+```{r}
+raw_train_data <- df
+raw_train_data[ ,c('Admission.time', 'Discharge.time')] <- list(NULL)
+raw_train_data <- raw_train_data[which(rowMeans(!is.na(raw_train_data)) > 0.7), which(colMeans(!is.na(raw_train_data)) > 0.32)]
+```
+Po wstępnym przetworzeniu zbioru, usunięto wszystkich pacjentów, którzy nie mieli kompletu pozostałych badań.
+```{r}
+raw_train_data <- raw_train_data %>% drop_na()
+patient_data <- raw_train_data %>%  group_by(PATIENT_ID) %>% summarise_at(vars(outcome, gender), last) %>% ungroup()
+raw_train_data <- raw_train_data %>%  group_by(PATIENT_ID) %>% summarise_if(is.numeric, max) %>% ungroup()
+```
+Tabela przedstawia ostateczny zbiór, który zostanie wykorzystany do uczenia klasyfikatora. Zawiera on 217 rekordóW.
+```{r}
+raw_train_data <- merge(x = patient_data, y = raw_train_data, by ="PATIENT_ID", all = TRUE)
+datatable(raw_train_data,options = list(scrollX = TRUE))
+```
+Dane treningowe stanowią 75% zbioru. Pozostałe 25% zostało podzielone pomiędzy dane testowe (40%) i walidujące (60%).
+```{r}
+inTraining <- createDataPartition(y = raw_train_data$outcome, p = .75, list = FALSE)
+training <- raw_train_data[inTraining,]
+testing_val  <- raw_train_data[-inTraining,]
+
+testing_val_index <- createDataPartition(y = testing_val$outcome, p = .6, list = FALSE)
+testing <- testing_val[-testing_val_index,]
+val <- testing_val[testing_val_index,]
+
+datatable(training, options = list(scrollX = TRUE))
+datatable(testing, options = list(scrollX = TRUE))
+datatable(val, options = list(scrollX = TRUE))
+```
+
+# Uczenie klasyfikatora.
+Dane zostały wykorzystane do uczenia klasyfikator random forest. 
+```{r}
+ctrl <- trainControl(method = "repeatedcv", number = 2,repeats = 5)
+fit <- train(outcome ~ .,
+             data = training,
+             method = "rf",
+             trControl = ctrl,
+             ntree = 10)
+
+fit
+rfGrid <- expand.grid(mtry = 10:30)
+gridCtrl <- trainControl(method = "repeatedcv", summaryFunction = twoClassSummary, classProbs = TRUE, number = 2, repeats = 5)
+fitTune <- train(outcome ~ .,
+             data = training,
+             method = "rf",
+             metric = "ROC",
+             preProc = c("center", "scale"),
+             trControl = gridCtrl,
+             tuneGrid = rfGrid,
+             ntree = 30)
+fitTune
+```
+Uzyskano bardzo wysoki wskaźnik “accuracy”. Nauczony klasyfikator poprawnie sklasyfikował wszystkie próbki. Niestety liczba danych wykorzystana w procesie jest za mała. Nie można mieć pewności, że klasyfikator będzie działać z tak dobrą skutecznością na znacznie większym zbiorze.
+```{r}
+predict_result <- predict(fitTune, newdata = val)
+confusionMatrix(data = predict_result, val$outcome)
+
+```
